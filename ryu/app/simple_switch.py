@@ -15,6 +15,8 @@
 
 import logging
 import struct
+import ctypes
+
 
 from ryu.base import app_manager
 from ryu.controller import mac_to_port
@@ -38,52 +40,111 @@ LOG = logging.getLogger('ryu.app.simple_switch')
 class SimpleSwitch(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
 
+    _CONTEXTS = {
+    'mac2port': mac_to_port.MacToPortTable
+    }
+
     def __init__(self, *args, **kwargs):
         super(SimpleSwitch, self).__init__(*args, **kwargs)
+        self.mac2port = kwargs['mac2port']
         self.mac_to_port = {}
 
-    def add_flow(self, datapath, in_port, dst, actions):
+    def add_flow(self, datapath, in_port, eth_type, dst, actions):
         ofproto = datapath.ofproto
 
         wildcards = ofproto_v1_0.OFPFW_ALL
         wildcards &= ~ofproto_v1_0.OFPFW_IN_PORT
         wildcards &= ~ofproto_v1_0.OFPFW_DL_DST
+        wildcards &= ~ofproto_v1_0.OFPFW_DL_TYPE
 
         match = datapath.ofproto_parser.OFPMatch(
             wildcards, in_port, 0, dst,
-            0, 0, 0, 0, 0, 0, 0, 0, 0)
+            0, 0, eth_type, 0, 0, 0, 0, 0, 0)
 
         mod = datapath.ofproto_parser.OFPFlowMod(
             datapath=datapath, match=match, cookie=0,
-            command=ofproto.OFPFC_ADD, idle_timeout=0, hard_timeout=0,
+            command=ofproto.OFPFC_ADD, idle_timeout=180, hard_timeout=180,
             priority=ofproto.OFP_DEFAULT_PRIORITY,
             flags=ofproto.OFPFF_SEND_FLOW_REM, actions=actions)
         datapath.send_msg(mod)
+
+    def _drop_packet(self, msg):
+        datapath = msg.datapath
+        #LOG.debug("Dropping packet; Dpid: %s; In port: %s",
+        #            datapath.id, msg.in_port)
+        datapath.send_packet_out(msg.buffer_id, msg.in_port, [])
+
+    def _handle_arp_packets(self, msg, dst, src, _eth_type):
+        datapath = msg.datapath
+        dpid = datapath.id
+        #print 'yes. received arp packet.'
+        mydata = ctypes.create_string_buffer(42)
+        HTYPE, PTYPE, HLEN, PLEN, OPER, SHA, SPA, THA, TPA = struct.unpack_from('!HHbbH6s4s6s4s', buffer(msg.data), 14)
+        print 'HTYPE = %d, PTYPE = %d, HLEN = %d, PLEN = %d, OPER = %d, SHA = %s, SPA = %s, THA = %s, TPA = %s' % (
+                HTYPE, PTYPE, HLEN, PLEN, OPER, mac.haddr_to_str(SHA), mac.ipaddr_to_str(SPA), mac.haddr_to_str(THA), mac.ipaddr_to_str(TPA))
+        dst_ip = SPA
+        dst_mac = SHA
+        src_ip = TPA
+        #src_mac = self.mac2port.ip_to_mac[datapath.id][TPA]
+        if (TPA in self.mac2port.ip_to_mac):
+            src_mac = self.mac2port.ip_to_mac[TPA]
+        else:
+            print 'IP is not registered'
+            print self.mac2port.ip_to_mac
+            self._drop_packet(msg)
+            return
+        #learn a mac address to avoid FLOOD next time.
+        #self.mac_to_port[dpid][src] = self.mac2port.mac_to_port[dpid][src]
+        #self.mac2port.mac_to_port[dpid][src] = msg.in_port
+        struct.pack_into('!6s6sHHHbbH6s4s6s4s', mydata, 0, src, dst, _eth_type, HTYPE, PTYPE, HLEN, PLEN, 2, src_mac, src_ip, dst_mac, dst_ip)
+        #print '\n\n\n'
+        HTYPE, PTYPE, HLEN, PLEN, OPER, SHA, SPA, THA, TPA = struct.unpack_from('!HHbbH6s4s6s4s', buffer(mydata), 14)
+        print 'HTYPE = %d, PTYPE = %d, HLEN = %d, PLEN = %d, OPER = %d, SHA = %s, SPA = %s, THA = %s, TPA = %s' % (
+                HTYPE, PTYPE, HLEN, PLEN, OPER, mac.haddr_to_str(SHA), mac.ipaddr_to_str(SPA), mac.haddr_to_str(THA), mac.ipaddr_to_str(TPA))
+        out_port = msg.in_port
+        actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+        datapath.send_packet_out(actions=actions, data=mydata)
+        self._drop_packet(msg)
+        return
+
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
+        dpid = datapath.id
 
         dst, src, _eth_type = struct.unpack_from('!6s6sH', buffer(msg.data), 0)
 
-        dpid = datapath.id
-        self.mac_to_port.setdefault(dpid, {})
-
+        #if datapath.id != 0x80027513556:
+        #    return
         LOG.info("packet in %s %s %s %s",
                  dpid, haddr_to_str(src), haddr_to_str(dst), msg.in_port)
 
-        # learn a mac address to avoid FLOOD next time.
-        self.mac_to_port[dpid][src] = msg.in_port
+        self.mac_to_port.setdefault(dpid, {})
+
         broadcast = (dst == mac.BROADCAST) or mac.is_multicast(dst)
-    
+
+        #learn a mac address to avoid FLOOD next time.
+        if src not in self.mac_to_port[dpid]:
+            self.mac_to_port[dpid][src] = msg.in_port
+        #self.mac2port.mac_to_port[dpid][dst] = msg.in_port
+
         if broadcast:
-            out_port = ofproto.OFPP_FLOOD
-            LOG.info("broadcast frame, flood and install flow")
+            if (_eth_type == 2054): #ARP request
+                self._handle_arp_packets(msg, dst, src, _eth_type)
+                return
+            else:
+                LOG.info("broadcast frame, DROP and install flow (RULE) to the switch")
+                actions = [] #[datapath.ofproto_parser.OFPActionOutput([])]
+                self.add_flow(datapath, msg.in_port, _eth_type, dst, actions)
+                self._drop_packet(msg)
+                return
         elif src != dst:
-            if dst in self.mac_to_port[dpid]:
+            if (dst in self.mac_to_port[dpid]):
                 out_port = self.mac_to_port[dpid][dst]
+                LOG.info("out_port found %s", out_port)
             else:
                 LOG.info("out_port not found")
                 out_port = ofproto.OFPP_FLOOD
@@ -93,9 +154,16 @@ class SimpleSwitch(app_manager.RyuApp):
 
         actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
 
+        if not broadcast and out_port != ofproto.OFPP_FLOOD and out_port == msg.in_port:
+            actions = []
+            self.add_flow(datapath, msg.in_port, _eth_type, dst, actions)
+            self._drop_packet(msg)
+            return
+
         # install a flow to avoid packet_in next time
         if broadcast or (out_port != ofproto.OFPP_FLOOD):
-            self.add_flow(datapath, msg.in_port, dst, actions)
+            LOG.info("install flow: out_port %s ", out_port)
+            self.add_flow(datapath, msg.in_port, _eth_type, dst, actions)
 
         out = datapath.ofproto_parser.OFPPacketOut(
             datapath=datapath, buffer_id=msg.buffer_id, in_port=msg.in_port,
@@ -107,6 +175,9 @@ class SimpleSwitch(app_manager.RyuApp):
         msg = ev.msg
         reason = msg.reason
         port_no = msg.desc.port_no
+
+        #if msg.datapath.id != 0x80027513556:
+        #    return
 
         ofproto = msg.datapath.ofproto
         if reason == ofproto.OFPPR_ADD:

@@ -34,7 +34,7 @@ from ryu.exception import PortNotFound, PortAlreadyExist, PortUnknown
 from ryu.exception import BondAlreadyExist, BondNotFound, BondNetworkMismatch, BondPortNotFound, BondPortAlreadyBonded
 from ryu.app.wsgi import ControllerBase, WSGIApplication
 from ryu.exception import MacAddressDuplicated, MacAddressNotFound
-from ryu.lib.mac import is_multicast, haddr_to_str, haddr_to_bin
+from ryu.lib.mac import is_multicast, haddr_to_str, haddr_to_bin, ipaddr_to_bin, ipaddr_to_str
 from ryu.app.rest_nw_id import NW_ID_EXTERNAL
 
 ## TODO:XXX
@@ -83,10 +83,12 @@ class NetworkController(ControllerBase):
         self.nw = data.get('nw')
         self.mac2net = data.get('mac2net')
         self.api_db = data.get('api_db')
+        self.mac2port = data.get('mac2port')
 
         assert self.nw is not None
         assert self.mac2net is not None
         assert self.api_db is not None
+        assert self.mac2port is not None
 
     def create(self, req, network_id, **_kwargs):
         try:
@@ -123,6 +125,20 @@ class NetworkController(ControllerBase):
             self.api_db.addMAC(network_id, mac)
         except MacAddressDuplicated:
             return Response(status=409)
+        else:
+            return Response(status=200)
+
+    def add_ip(self, req, mac, ip, dpid, port_id, **_kwargs):
+        try:
+            print 'in add_ip function'
+            self.mac2port.dpid_add(int(dpid, 16))
+            self.mac2port.port_add(int(dpid, 16), int(port_id), haddr_to_bin(mac), ipaddr_to_bin(ip))
+            print 'dpid: %d port_id: %d' % (int(dpid, 16), int(port_id))
+        except ValueError:
+            print 'Invalid ip address format. Check the ip you are registering: %s' % ip
+            return Response(status=500)
+        except:
+            return Response(status=500)
         else:
             return Response(status=200)
 
@@ -554,7 +570,9 @@ class restapi(app_manager.RyuApp):
         # Change packet handler
         wsgi.registory['NetworkController'] = { 'nw' : self.nw,
                                                 'mac2net' : self.mac2net,
-                                                'api_db' : self.api_db }
+                                                'api_db' : self.api_db,
+                                                'mac2port' : self.mac2port }
+
         mapper.connect('networks', '/v1.0/packethandler/{handler_id}',
                        controller=NetworkController, action='setPacketHandler',
                        conditions=dict(method=['PUT']))
@@ -602,11 +620,17 @@ class restapi(app_manager.RyuApp):
                        controller=NetworkController, action='del_iface',
                        conditions=dict(method=['DELETE']))
 
+        # Broadcast-less related APIs
+        mapper.connect('networks', uri + '/macipportdp/{mac}/{ip}/{dpid}_{port_id}',
+                       controller=NetworkController, action='add_ip',
+                       conditions=dict(method=['PUT']))       
+        
         # PortController related APIs
         wsgi.registory['PortController'] = {'nw' : self.nw,
                                             'fv_cli' : self.fv_cli,
                                             'mac2port' : self.mac2port,
-                                            'api_db' : self.api_db    }
+                                            'api_db' : self.api_db }
+
         mapper.connect('networks', uri,
                        controller=PortController, action='lists',
                        conditions=dict(method=['GET']))
@@ -629,7 +653,7 @@ class restapi(app_manager.RyuApp):
                                                  'dpset' : self.dpset,
                                                  'mac2port' : self.mac2port,
                                                  'mac2net' : self.mac2net,
-                                                 'api_db' : self.api_db     }
+                                                 'api_db' : self.api_db }
         uri = '/v1.0/flowvisor'
         mapper.connect('flowvisor', uri,
                        controller=FlowVisorController, action='listSlices',

@@ -19,6 +19,7 @@ import itertools
 
 # Internal representation of mac address is string[6]
 _HADDR_LEN = 6
+_IPADDR_LEN = 4
 
 DONTCARE = '\x00' * 6
 BROADCAST = '\xff' * 6
@@ -49,3 +50,13 @@ def haddr_to_bin(string):
 def haddr_bitand(addr, mask):
     return ''.join(chr(ord(a) & ord(m)) for (a, m)
                    in itertools.izip(addr, mask))
+
+def ipaddr_to_bin(string):
+	decimals = string.split('.')
+	if len(decimals) != _IPADDR_LEN:
+	    raise ValueError('Invalid format for ip address: %s' % string)
+	return ''.join(chr(int(d, 10)) for d in decimals)
+
+def ipaddr_to_str(addr):
+	assert len(addr) == _IPADDR_LEN
+	return '.'.join('%d' % ord(char) for char in addr)
